@@ -1,0 +1,15 @@
+results/
+data.json
+data*.json
+__pycache__/
+
+*/.DS_Store
+.DS_Store
+tmp/
+tmp_notes.md
+
+dist/
+build
+*backup*
+
+algebra_7_class/
