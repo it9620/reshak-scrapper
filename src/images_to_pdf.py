@@ -2,15 +2,19 @@
 """
 images_to_pdf.py
 
-Convert images from a directory tree into a single PDF.
-This is intended for folders like `algebra_7_class/<exercise>/<image files>`,
-where exercises and image files should be ordered numerically when possible.
+Convert images from an exercise directory tree into a single PDF.
+This is intended for folders like `algebra_7_class/<exercise>/<image files>`.
+
+For each exercise folder:
+    - the first image file is ignored as a page source
+    - a generated text title page is inserted instead
+    - a PDF outline entry is added for fast navigation
 
 Supported formats:
     .heic, .heif, .jpg, .jpeg, .png, .bmp, .tif, .tiff, .webp
 
 Requirements:
-    pip install pillow pillow-heif
+    pip install pillow pillow-heif reportlab
 
 Usage:
     python src/images_to_pdf.py algebra_7_class algebra_7_class.pdf
@@ -21,11 +25,14 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
+from reportlab.lib.colors import black, white
+from reportlab.lib.utils import ImageReader
+from reportlab.pdfgen import canvas
 
 
 SUPPORTED_EXTENSIONS = {
@@ -40,15 +47,29 @@ SUPPORTED_EXTENSIONS = {
     ".webp",
 }
 
+DEFAULT_MARGIN = 24
+DEFAULT_TITLE_PAGE_HEIGHT = 630
+TITLE_FONT_NAME = "Helvetica-Bold"
+TITLE_FONT_MIN_SIZE = 32
+TITLE_FONT_MAX_SIZE = 220
+TITLE_FONT_STEP = 4
+
+
+@dataclass(frozen=True)
+class ExerciseSection:
+    exercise: str
+    directory: Path
+    source_images: list[Path]
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Convert images from a directory tree into a PDF."
+        description="Convert exercise image folders into a bookmarked PDF."
     )
     parser.add_argument(
         "input_dir",
         type=Path,
-        help="Root directory containing exercise folders and images",
+        help="Root directory containing exercise subfolders",
     )
     parser.add_argument(
         "output_pdf",
@@ -58,8 +79,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--margin",
         type=int,
-        default=24,
-        help="White margin around each image in pixels, default: 24",
+        default=DEFAULT_MARGIN,
+        help=f"White margin around each image in pixels, default: {DEFAULT_MARGIN}",
+    )
+    parser.add_argument(
+        "--title-page-height",
+        type=int,
+        default=DEFAULT_TITLE_PAGE_HEIGHT,
+        help=(
+            "Height of generated exercise title pages in pixels, "
+            f"default: {DEFAULT_TITLE_PAGE_HEIGHT}"
+        ),
     )
     return parser.parse_args()
 
@@ -79,96 +109,164 @@ def path_sort_key(path: Path) -> tuple:
     return tuple(key)
 
 
-def find_images(input_dir: Path) -> list[Path]:
-    files = [p for p in input_dir.rglob("*") if p.is_file()]
-    images = [p for p in files if p.suffix.lower() in SUPPORTED_EXTENSIONS]
-    images.sort(key=lambda path: path_sort_key(path.relative_to(input_dir)))
+def list_supported_files(directory: Path) -> list[Path]:
+    files = [path for path in directory.iterdir() if path.is_file()]
+    images = [path for path in files if path.suffix.lower() in SUPPORTED_EXTENSIONS]
+    images.sort(key=lambda path: path_sort_key(path))
     return images
 
 
-def to_pdf_ready_image(path: Path) -> Image.Image:
-    """
-    Open an image and convert it into a PDF-safe RGB PIL image.
-    Handles EXIF rotation and alpha transparency.
-    """
+def collect_sections(input_dir: Path) -> list[ExerciseSection]:
+    subdirs = [path for path in input_dir.iterdir() if path.is_dir()]
+    subdirs.sort(key=path_sort_key)
+
+    sections: list[ExerciseSection] = []
+    for subdir in subdirs:
+        images = list_supported_files(subdir)
+        if not images:
+            continue
+
+        sections.append(
+            ExerciseSection(
+                exercise=subdir.name,
+                directory=subdir,
+                source_images=images[1:],
+            )
+        )
+
+    return sections
+
+
+def load_image_size(path: Path) -> tuple[int, int]:
     with Image.open(path) as img:
         img = ImageOps.exif_transpose(img)
-
-        if img.mode in ("RGBA", "LA") or ("transparency" in img.info):
-            background = Image.new("RGB", img.size, (255, 255, 255))
-            alpha_source = img.convert("RGBA")
-            background.paste(alpha_source, mask=alpha_source.getchannel("A"))
-            return background
-
-        return img.convert("RGB")
+        return img.size
 
 
-def compute_canvas_width(images: Iterable[Image.Image], margin: int) -> int:
-    max_width = max(image.width for image in images)
+def compute_canvas_width(sections: list[ExerciseSection], margin: int) -> int:
+    max_width = 0
+    for section in sections:
+        for image_path in section.source_images:
+            width, _ = load_image_size(image_path)
+            max_width = max(max_width, width)
     return max_width + margin * 2
 
 
-def build_pdf_page(image: Image.Image, canvas_width: int, margin: int) -> Image.Image:
-    available_width = max(canvas_width - margin * 2, 1)
-
-    if image.width > available_width:
-        scale = available_width / image.width
-        resized_width = available_width
-        resized_height = max(int(round(image.height * scale)), 1)
-        image = image.resize((resized_width, resized_height), Image.Resampling.LANCZOS)
-    else:
-        image = image.copy()
-
-    page_height = image.height + margin * 2
-    page = Image.new("RGB", (canvas_width, page_height), "white")
-    x = (canvas_width - image.width) // 2
-    page.paste(image, (x, margin))
-    image.close()
-    return page
+def fit_font_size(
+    pdf: canvas.Canvas,
+    text: str,
+    page_width: int,
+    margin: int,
+) -> int:
+    max_text_width = max(page_width - margin * 2, 1)
+    for font_size in range(TITLE_FONT_MAX_SIZE, TITLE_FONT_MIN_SIZE - 1, -TITLE_FONT_STEP):
+        if pdf.stringWidth(text, TITLE_FONT_NAME, font_size) <= max_text_width:
+            return font_size
+    return TITLE_FONT_MIN_SIZE
 
 
-def build_pdf(image_paths: Iterable[Path], output_pdf: Path, margin: int) -> None:
-    prepared_images: list[Image.Image] = []
-    pdf_pages: list[Image.Image] = []
+def draw_title_page(
+    pdf: canvas.Canvas,
+    exercise: str,
+    page_width: int,
+    page_height: int,
+    margin: int,
+) -> None:
+    pdf.setPageSize((page_width, page_height))
+    pdf.setFillColor(white)
+    pdf.rect(0, 0, page_width, page_height, fill=1, stroke=0)
 
-    try:
-        for path in image_paths:
-            print(f"Adding: {path}")
-            prepared_images.append(to_pdf_ready_image(path))
+    title = f"Exercise {exercise}"
+    font_size = fit_font_size(pdf, title, page_width, margin)
+    pdf.setFillColor(black)
+    pdf.setFont(TITLE_FONT_NAME, font_size)
 
-        if not prepared_images:
-            raise ValueError("No supported image files found.")
+    text_width = pdf.stringWidth(title, TITLE_FONT_NAME, font_size)
+    x = (page_width - text_width) / 2
+    y = (page_height - font_size) / 2
+    pdf.drawString(x, y, title)
 
-        canvas_width = compute_canvas_width(prepared_images, margin)
 
-        for image in prepared_images:
-            pdf_pages.append(build_pdf_page(image, canvas_width, margin))
+def draw_image_page(
+    pdf: canvas.Canvas,
+    image_path: Path,
+    page_width: int,
+    margin: int,
+) -> None:
+    with Image.open(image_path) as img:
+        img = ImageOps.exif_transpose(img)
 
-        first, rest = pdf_pages[0], pdf_pages[1:]
+        if img.mode not in ("RGB", "L"):
+            background = Image.new("RGB", img.size, (255, 255, 255))
+            alpha_source = img.convert("RGBA")
+            background.paste(alpha_source, mask=alpha_source.getchannel("A"))
+            rendered = background
+        elif img.mode == "L":
+            rendered = img.convert("RGB")
+        else:
+            rendered = img.convert("RGB")
 
-        output_pdf.parent.mkdir(parents=True, exist_ok=True)
-        Image.init()
-        first.save(output_pdf, save_all=True, append_images=rest)
-        print(f"\nPDF created: {output_pdf}")
+        available_width = max(page_width - margin * 2, 1)
+        scale = min(1.0, available_width / rendered.width)
+        draw_width = max(int(round(rendered.width * scale)), 1)
+        draw_height = max(int(round(rendered.height * scale)), 1)
+        page_height = draw_height + margin * 2
 
-    finally:
-        for img in prepared_images:
-            try:
-                img.close()
-            except Exception:
-                pass
-        for img in pdf_pages:
-            try:
-                img.close()
-            except Exception:
-                pass
+        pdf.setPageSize((page_width, page_height))
+        pdf.setFillColor(white)
+        pdf.rect(0, 0, page_width, page_height, fill=1, stroke=0)
+
+        x = (page_width - draw_width) / 2
+        y = margin
+        pdf.drawImage(
+            ImageReader(rendered),
+            x,
+            y,
+            width=draw_width,
+            height=draw_height,
+            preserveAspectRatio=True,
+            mask="auto",
+        )
+
+
+def build_pdf(
+    sections: list[ExerciseSection],
+    output_pdf: Path,
+    margin: int,
+    title_page_height: int,
+) -> None:
+    if not sections:
+        raise ValueError("No exercise folders with supported image files found.")
+
+    canvas_width = compute_canvas_width(sections, margin)
+    if canvas_width <= margin * 2:
+        canvas_width = 1200 + margin * 2
+
+    output_pdf.parent.mkdir(parents=True, exist_ok=True)
+    pdf = canvas.Canvas(str(output_pdf), pageCompression=1)
+
+    for section in sections:
+        bookmark_name = f"exercise-{section.exercise}"
+        print(f"Adding exercise {section.exercise}")
+
+        draw_title_page(pdf, section.exercise, canvas_width, title_page_height, margin)
+        pdf.bookmarkPage(bookmark_name)
+        pdf.addOutlineEntry(f"Exercise {section.exercise}", bookmark_name, level=0)
+        pdf.showPage()
+
+        for image_path in section.source_images:
+            print(f"  Adding image: {image_path}")
+            draw_image_page(pdf, image_path, canvas_width, margin)
+            pdf.showPage()
+
+    pdf.save()
+    print(f"\nPDF created: {output_pdf}")
 
 
 def main() -> int:
     register_heif_opener()
 
     args = parse_args()
-
     input_dir: Path = args.input_dir
     output_pdf: Path = args.output_pdf
 
@@ -184,18 +282,26 @@ def main() -> int:
         print("Error: margin must be zero or greater.", file=sys.stderr)
         return 1
 
-    image_paths = find_images(input_dir)
-
-    if not image_paths:
-        print("Error: no supported image files found.", file=sys.stderr)
+    if args.title_page_height <= 0:
+        print("Error: title-page-height must be greater than zero.", file=sys.stderr)
         return 1
 
-    print("Files to include:")
-    for path in image_paths:
-        print(f"  {path.relative_to(input_dir)}")
+    sections = collect_sections(input_dir)
+    if not sections:
+        print("Error: no exercise folders with supported image files found.", file=sys.stderr)
+        return 1
+
+    print("Exercises to include:")
+    for section in sections:
+        print(f"  {section.exercise}: {len(section.source_images)} page image(s)")
 
     try:
-        build_pdf(image_paths, output_pdf, margin=args.margin)
+        build_pdf(
+            sections=sections,
+            output_pdf=output_pdf,
+            margin=args.margin,
+            title_page_height=args.title_page_height,
+        )
         return 0
     except Exception as exc:
         print(f"Error while creating PDF: {exc}", file=sys.stderr)

@@ -26,4 +26,4 @@ Each exercise folder starts with a generated `01.png` title image containing the
 python src/images_to_pdf.py algebra_7_class algebra_7_class.pdf
 ```
 
-The PDF builder scans subfolders recursively, sorts exercise folders and image files numerically, and centers narrower images on a common page width so different source widths stay aligned.
+The PDF builder reads immediate exercise subfolders, skips the first generated image in each folder, inserts a text title page like `Exercise 700`, and adds PDF outline entries for fast navigation. Real images are centered on a common page width so different source widths stay aligned.
