@@ -183,18 +183,18 @@ def compute_contents_page_count(sections: list[ExerciseSection], page_height: in
 def build_contents_entries(
     sections: list[ExerciseSection],
     contents_page_count: int,
-) -> list[tuple[str, int]]:
-    entries: list[tuple[str, int]] = []
+) -> list[tuple[str, int, str]]:
+    entries: list[tuple[str, int, str]] = []
     current_page = contents_page_count + 1
     for section in sections:
-        entries.append((section.exercise, current_page))
+        entries.append((section.exercise, current_page, f"exercise-{section.exercise}"))
         current_page += section_page_count(section)
     return entries
 
 
 def draw_contents_pages(
     pdf: canvas.Canvas,
-    entries: list[tuple[str, int]],
+    entries: list[tuple[str, int, str]],
     page_width: int,
     page_height: int,
     title: str,
@@ -215,12 +215,25 @@ def draw_contents_pages(
 
         y = page_height - TOC_TOP_MARGIN - TOC_LINE_HEIGHT * 2
         pdf.setFont(TOC_ENTRY_FONT_NAME, TOC_ENTRY_FONT_SIZE)
-        for exercise, page_number in chunk:
+        for exercise, page_number, bookmark_name in chunk:
             left_text = f"Exercise {exercise}"
             right_text = str(page_number)
             pdf.drawString(DEFAULT_MARGIN, y, left_text)
             right_width = pdf.stringWidth(right_text, TOC_ENTRY_FONT_NAME, TOC_ENTRY_FONT_SIZE)
             pdf.drawString(page_width - DEFAULT_MARGIN - right_width, y, right_text)
+
+            pdf.linkRect(
+                "",
+                bookmark_name,
+                (
+                    DEFAULT_MARGIN,
+                    y - 4,
+                    page_width - DEFAULT_MARGIN,
+                    y + TOC_ENTRY_FONT_SIZE + 2,
+                ),
+                relative=0,
+                thickness=0,
+            )
             y -= TOC_LINE_HEIGHT
 
         pdf.showPage()
