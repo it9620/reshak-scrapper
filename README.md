@@ -23,6 +23,7 @@ Each exercise folder starts with a generated `01.png` title image containing the
 ## Images to pdf
 
 ```sh
-py images_to_pdf.py "images" "album.pdf"
+python src/images_to_pdf.py algebra_7_class algebra_7_class.pdf
 ```
 
+The PDF builder scans subfolders recursively, sorts exercise folders and image files numerically, and centers narrower images on a common page width so different source widths stay aligned.
