@@ -8,8 +8,9 @@ This is intended for folders like `algebra_7_class/<exercise>/<image files>`.
 For each exercise folder:
     - the first image file is ignored as a page source
     - a small generated header is placed above the first real image page
-    - PDF contents pages are generated at the start
-    - a PDF outline entry is added for fast navigation
+    - compact clickable contents pages are generated at the start
+    - multiple images can share a page until there is no room left
+    - page numbers are added at the bottom
 
 Supported formats:
     .heic, .heif, .jpg, .jpeg, .png, .bmp, .tif, .tiff, .webp
@@ -32,6 +33,7 @@ from pathlib import Path
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
 from reportlab.lib.colors import black, white
+from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 
@@ -49,17 +51,22 @@ SUPPORTED_EXTENSIONS = {
 }
 
 DEFAULT_MARGIN = 24
-HEADER_HEIGHT = 44
-HEADER_GAP = 12
+DEFAULT_TOC_COLUMNS = 3
+PAGE_WIDTH, PAGE_HEIGHT = A4
 HEADER_FONT_NAME = "Helvetica-Bold"
-HEADER_FONT_SIZE = 20
+HEADER_FONT_SIZE = 18
+HEADER_SPACING = 10
+BLOCK_SPACING = 16
+FOOTER_FONT_NAME = "Helvetica"
+FOOTER_FONT_SIZE = 11
+FOOTER_HEIGHT = 24
 TOC_TITLE_FONT_NAME = "Helvetica-Bold"
-TOC_TITLE_FONT_SIZE = 28
+TOC_TITLE_FONT_SIZE = 26
 TOC_ENTRY_FONT_NAME = "Helvetica"
-TOC_ENTRY_FONT_SIZE = 14
-TOC_LINE_HEIGHT = 20
-TOC_TOP_MARGIN = 56
-TOC_BOTTOM_MARGIN = 48
+TOC_ENTRY_FONT_SIZE = 11
+TOC_LINE_HEIGHT = 15
+TOC_TITLE_GAP = 28
+TOC_COLUMN_GAP = 20
 
 
 @dataclass(frozen=True)
@@ -69,9 +76,24 @@ class ExerciseSection:
     source_images: list[Path]
 
 
+@dataclass(frozen=True)
+class ContentBlock:
+    exercise: str
+    image_path: Path | None
+    draw_width: float
+    draw_height: float
+    show_header: bool
+    bookmark_name: str
+
+    @property
+    def content_height(self) -> float:
+        header_height = HEADER_FONT_SIZE + HEADER_SPACING if self.show_header else 0
+        return header_height + self.draw_height
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Convert exercise image folders into a bookmarked PDF."
+        description="Convert exercise image folders into a compact bookmarked PDF."
     )
     parser.add_argument(
         "input_dir",
@@ -87,12 +109,18 @@ def parse_args() -> argparse.Namespace:
         "--margin",
         type=int,
         default=DEFAULT_MARGIN,
-        help=f"White margin around each image in pixels, default: {DEFAULT_MARGIN}",
+        help=f"Page margin in points, default: {DEFAULT_MARGIN}",
     )
     parser.add_argument(
         "--toc-title",
         default="Contents",
         help="Title used for generated contents pages",
+    )
+    parser.add_argument(
+        "--toc-columns",
+        type=int,
+        default=DEFAULT_TOC_COLUMNS,
+        help=f"Number of columns on contents pages, default: {DEFAULT_TOC_COLUMNS}",
     )
     return parser.parse_args()
 
@@ -115,7 +143,7 @@ def path_sort_key(path: Path) -> tuple:
 def list_supported_files(directory: Path) -> list[Path]:
     files = [path for path in directory.iterdir() if path.is_file()]
     images = [path for path in files if path.suffix.lower() in SUPPORTED_EXTENSIONS]
-    images.sort(key=lambda path: path_sort_key(path))
+    images.sort(key=path_sort_key)
     return images
 
 
@@ -146,150 +174,223 @@ def load_image_size(path: Path) -> tuple[int, int]:
         return img.size
 
 
-def compute_canvas_width(sections: list[ExerciseSection], margin: int) -> int:
-    max_width = 0
-    for section in sections:
-        for image_path in section.source_images:
-            width, _ = load_image_size(image_path)
-            max_width = max(max_width, width)
-    return max_width + margin * 2
-
-
-def fit_font_size(
-    pdf: canvas.Canvas,
-    text: str,
-    page_width: int,
+def build_content_blocks(
+    sections: list[ExerciseSection],
     margin: int,
-) -> int:
-    max_text_width = max(page_width - margin * 2, 1)
-    font_size = HEADER_FONT_SIZE
-    while font_size > 10:
-        if pdf.stringWidth(text, HEADER_FONT_NAME, font_size) <= max_text_width:
-            return font_size
-        font_size -= 1
-    return 10
+) -> list[ContentBlock]:
+    blocks: list[ContentBlock] = []
+    usable_width = PAGE_WIDTH - margin * 2
+    usable_height = PAGE_HEIGHT - margin * 2 - FOOTER_HEIGHT
+
+    for section in sections:
+        bookmark_name = f"exercise-{section.exercise}"
+
+        if not section.source_images:
+            blocks.append(
+                ContentBlock(
+                    exercise=section.exercise,
+                    image_path=None,
+                    draw_width=0,
+                    draw_height=0,
+                    show_header=True,
+                    bookmark_name=bookmark_name,
+                )
+            )
+            continue
+
+        for index, image_path in enumerate(section.source_images):
+            source_width, source_height = load_image_size(image_path)
+            header_height = HEADER_FONT_SIZE + HEADER_SPACING if index == 0 else 0
+            available_height = max(usable_height - header_height, 1)
+            scale = min(usable_width / source_width, available_height / source_height, 1.0)
+
+            blocks.append(
+                ContentBlock(
+                    exercise=section.exercise,
+                    image_path=image_path,
+                    draw_width=max(source_width * scale, 1),
+                    draw_height=max(source_height * scale, 1),
+                    show_header=index == 0,
+                    bookmark_name=bookmark_name,
+                )
+            )
+
+    return blocks
 
 
-def section_page_count(section: ExerciseSection) -> int:
-    return max(len(section.source_images), 1)
+def paginate_content(
+    blocks: list[ContentBlock],
+    margin: int,
+    starting_page_number: int,
+) -> tuple[list[list[ContentBlock]], dict[str, int]]:
+    pages: list[list[ContentBlock]] = []
+    exercise_start_pages: dict[str, int] = {}
+    usable_height = PAGE_HEIGHT - margin * 2 - FOOTER_HEIGHT
+
+    current_page_blocks: list[ContentBlock] = []
+    used_height = 0.0
+    current_page_number = starting_page_number
+
+    for block in blocks:
+        required_height = block.content_height
+        if current_page_blocks:
+            required_height += BLOCK_SPACING
+
+        if current_page_blocks and used_height + required_height > usable_height:
+            pages.append(current_page_blocks)
+            current_page_blocks = []
+            used_height = 0.0
+            current_page_number += 1
+            required_height = block.content_height
+
+        if block.exercise not in exercise_start_pages:
+            exercise_start_pages[block.exercise] = current_page_number
+
+        current_page_blocks.append(block)
+        used_height += required_height
+
+    if current_page_blocks:
+        pages.append(current_page_blocks)
+
+    return pages, exercise_start_pages
 
 
-def compute_contents_page_count(sections: list[ExerciseSection], page_height: int) -> int:
-    usable_height = page_height - TOC_TOP_MARGIN - TOC_BOTTOM_MARGIN - TOC_LINE_HEIGHT * 2
-    entries_per_page = max(usable_height // TOC_LINE_HEIGHT, 1)
-    return max((len(sections) + entries_per_page - 1) // entries_per_page, 1)
+def compute_toc_page_count(section_count: int, margin: int, toc_columns: int) -> int:
+    usable_height = PAGE_HEIGHT - margin * 2 - FOOTER_HEIGHT - TOC_TITLE_FONT_SIZE - TOC_TITLE_GAP
+    rows_per_column = max(int(usable_height // TOC_LINE_HEIGHT), 1)
+    entries_per_page = max(rows_per_column * toc_columns, 1)
+    return max((section_count + entries_per_page - 1) // entries_per_page, 1)
 
 
 def build_contents_entries(
     sections: list[ExerciseSection],
-    contents_page_count: int,
+    exercise_start_pages: dict[str, int],
 ) -> list[tuple[str, int, str]]:
-    entries: list[tuple[str, int, str]] = []
-    current_page = contents_page_count + 1
-    for section in sections:
-        entries.append((section.exercise, current_page, f"exercise-{section.exercise}"))
-        current_page += section_page_count(section)
-    return entries
+    return [
+        (section.exercise, exercise_start_pages[section.exercise], f"exercise-{section.exercise}")
+        for section in sections
+    ]
+
+
+def draw_page_number(pdf: canvas.Canvas, page_number: int) -> None:
+    text = str(page_number)
+    pdf.setFillColor(black)
+    pdf.setFont(FOOTER_FONT_NAME, FOOTER_FONT_SIZE)
+    text_width = pdf.stringWidth(text, FOOTER_FONT_NAME, FOOTER_FONT_SIZE)
+    pdf.drawString((PAGE_WIDTH - text_width) / 2, DEFAULT_MARGIN / 2, text)
 
 
 def draw_contents_pages(
     pdf: canvas.Canvas,
     entries: list[tuple[str, int, str]],
-    page_width: int,
-    page_height: int,
-    title: str,
-) -> None:
-    usable_height = page_height - TOC_TOP_MARGIN - TOC_BOTTOM_MARGIN - TOC_LINE_HEIGHT * 2
-    entries_per_page = max(usable_height // TOC_LINE_HEIGHT, 1)
+    toc_title: str,
+    toc_columns: int,
+    margin: int,
+) -> int:
+    usable_height = PAGE_HEIGHT - margin * 2 - FOOTER_HEIGHT - TOC_TITLE_FONT_SIZE - TOC_TITLE_GAP
+    rows_per_column = max(int(usable_height // TOC_LINE_HEIGHT), 1)
+    entries_per_page = max(rows_per_column * toc_columns, 1)
+    column_width = (PAGE_WIDTH - margin * 2 - TOC_COLUMN_GAP * (toc_columns - 1)) / toc_columns
 
-    for page_index in range(0, len(entries), entries_per_page):
-        chunk = entries[page_index : page_index + entries_per_page]
-        pdf.setPageSize((page_width, page_height))
+    page_number = 1
+    for page_start in range(0, len(entries), entries_per_page):
+        chunk = entries[page_start : page_start + entries_per_page]
+        pdf.setPageSize((PAGE_WIDTH, PAGE_HEIGHT))
         pdf.setFillColor(white)
-        pdf.rect(0, 0, page_width, page_height, fill=1, stroke=0)
+        pdf.rect(0, 0, PAGE_WIDTH, PAGE_HEIGHT, fill=1, stroke=0)
         pdf.setFillColor(black)
 
-        title_text = title if page_index == 0 else f"{title} ({page_index // entries_per_page + 1})"
+        title = toc_title if page_number == 1 else f"{toc_title} ({page_number})"
         pdf.setFont(TOC_TITLE_FONT_NAME, TOC_TITLE_FONT_SIZE)
-        pdf.drawString(DEFAULT_MARGIN, page_height - TOC_TOP_MARGIN, title_text)
+        pdf.drawString(margin, PAGE_HEIGHT - margin - TOC_TITLE_FONT_SIZE, title)
 
-        y = page_height - TOC_TOP_MARGIN - TOC_LINE_HEIGHT * 2
         pdf.setFont(TOC_ENTRY_FONT_NAME, TOC_ENTRY_FONT_SIZE)
-        for exercise, page_number, bookmark_name in chunk:
-            left_text = f"Exercise {exercise}"
-            right_text = str(page_number)
-            pdf.drawString(DEFAULT_MARGIN, y, left_text)
+        top_y = PAGE_HEIGHT - margin - TOC_TITLE_FONT_SIZE - TOC_TITLE_GAP
+
+        for index, (exercise, target_page, bookmark_name) in enumerate(chunk):
+            column_index = index // rows_per_column
+            row_index = index % rows_per_column
+            x = margin + column_index * (column_width + TOC_COLUMN_GAP)
+            y = top_y - row_index * TOC_LINE_HEIGHT
+
+            left_text = f"{exercise}"
+            right_text = str(target_page)
+            pdf.drawString(x, y, left_text)
             right_width = pdf.stringWidth(right_text, TOC_ENTRY_FONT_NAME, TOC_ENTRY_FONT_SIZE)
-            pdf.drawString(page_width - DEFAULT_MARGIN - right_width, y, right_text)
+            pdf.drawString(x + column_width - right_width, y, right_text)
 
             pdf.linkRect(
                 "",
                 bookmark_name,
-                (
-                    DEFAULT_MARGIN,
-                    y - 4,
-                    page_width - DEFAULT_MARGIN,
-                    y + TOC_ENTRY_FONT_SIZE + 2,
-                ),
+                (x, y - 3, x + column_width, y + TOC_ENTRY_FONT_SIZE + 2),
                 relative=0,
                 thickness=0,
             )
-            y -= TOC_LINE_HEIGHT
 
+        draw_page_number(pdf, page_number)
         pdf.showPage()
+        page_number += 1
+
+    return page_number - 1
 
 
-def draw_image_page(
-    pdf: canvas.Canvas,
-    image_path: Path,
-    page_width: int,
-    margin: int,
-    exercise: str | None = None,
-) -> None:
-    with Image.open(image_path) as img:
+def render_image_to_rgb(path: Path) -> Image.Image:
+    with Image.open(path) as img:
         img = ImageOps.exif_transpose(img)
 
-        if img.mode not in ("RGB", "L"):
+        if img.mode in ("RGBA", "LA") or "transparency" in img.info:
             background = Image.new("RGB", img.size, (255, 255, 255))
-            alpha_source = img.convert("RGBA")
-            background.paste(alpha_source, mask=alpha_source.getchannel("A"))
-            rendered = background
-        elif img.mode == "L":
-            rendered = img.convert("RGB")
-        else:
-            rendered = img.convert("RGB")
+            rgba = img.convert("RGBA")
+            background.paste(rgba, mask=rgba.getchannel("A"))
+            return background
 
-        available_width = max(page_width - margin * 2, 1)
-        scale = min(1.0, available_width / rendered.width)
-        draw_width = max(int(round(rendered.width * scale)), 1)
-        draw_height = max(int(round(rendered.height * scale)), 1)
-        header_height = HEADER_HEIGHT if exercise else 0
-        gap = HEADER_GAP if exercise else 0
-        page_height = draw_height + margin * 2 + header_height + gap
+        return img.convert("RGB")
 
-        pdf.setPageSize((page_width, page_height))
+
+def draw_content_pages(
+    pdf: canvas.Canvas,
+    pages: list[list[ContentBlock]],
+    starting_page_number: int,
+    margin: int,
+) -> None:
+    for page_offset, blocks in enumerate(pages):
+        page_number = starting_page_number + page_offset
+        pdf.setPageSize((PAGE_WIDTH, PAGE_HEIGHT))
         pdf.setFillColor(white)
-        pdf.rect(0, 0, page_width, page_height, fill=1, stroke=0)
+        pdf.rect(0, 0, PAGE_WIDTH, PAGE_HEIGHT, fill=1, stroke=0)
 
-        if exercise:
-            header_text = f"Exercise {exercise}"
-            font_size = fit_font_size(pdf, header_text, page_width, margin)
-            pdf.setFillColor(black)
-            pdf.setFont(HEADER_FONT_NAME, font_size)
-            header_y = page_height - margin - font_size
-            pdf.drawString(margin, header_y, header_text)
+        current_top = PAGE_HEIGHT - margin
+        for index, block in enumerate(blocks):
+            if index > 0:
+                current_top -= BLOCK_SPACING
 
-        x = (page_width - draw_width) / 2
-        y = margin
-        pdf.drawImage(
-            ImageReader(rendered),
-            x,
-            y,
-            width=draw_width,
-            height=draw_height,
-            preserveAspectRatio=True,
-            mask="auto",
-        )
+            if block.show_header:
+                header_text = f"Exercise {block.exercise}"
+                pdf.bookmarkPage(block.bookmark_name)
+                pdf.addOutlineEntry(header_text, block.bookmark_name, level=0)
+                pdf.setFillColor(black)
+                pdf.setFont(HEADER_FONT_NAME, HEADER_FONT_SIZE)
+                pdf.drawString(margin, current_top - HEADER_FONT_SIZE, header_text)
+                current_top -= HEADER_FONT_SIZE + HEADER_SPACING
+
+            if block.image_path is None:
+                continue
+
+            image_y = current_top - block.draw_height
+            with render_image_to_rgb(block.image_path) as rendered:
+                pdf.drawImage(
+                    ImageReader(rendered),
+                    (PAGE_WIDTH - block.draw_width) / 2,
+                    image_y,
+                    width=block.draw_width,
+                    height=block.draw_height,
+                    preserveAspectRatio=True,
+                    mask="auto",
+                )
+            current_top = image_y
+
+        draw_page_number(pdf, page_number)
+        pdf.showPage()
 
 
 def build_pdf(
@@ -297,57 +398,40 @@ def build_pdf(
     output_pdf: Path,
     margin: int,
     toc_title: str,
+    toc_columns: int,
 ) -> None:
     if not sections:
         raise ValueError("No exercise folders with supported image files found.")
 
-    canvas_width = compute_canvas_width(sections, margin)
-    if canvas_width <= margin * 2:
-        canvas_width = 1200 + margin * 2
+    blocks = build_content_blocks(sections, margin)
+    toc_page_count = compute_toc_page_count(len(sections), margin, toc_columns)
+    content_pages, exercise_start_pages = paginate_content(
+        blocks,
+        margin,
+        starting_page_number=toc_page_count + 1,
+    )
+    contents_entries = build_contents_entries(sections, exercise_start_pages)
 
     output_pdf.parent.mkdir(parents=True, exist_ok=True)
     pdf = canvas.Canvas(str(output_pdf), pageCompression=1)
-    contents_page_height = 842
-    contents_page_count = compute_contents_page_count(sections, contents_page_height)
-    contents_entries = build_contents_entries(sections, contents_page_count)
 
-    draw_contents_pages(
+    actual_toc_pages = draw_contents_pages(
         pdf,
         contents_entries,
-        canvas_width,
-        contents_page_height,
-        toc_title,
+        toc_title=toc_title,
+        toc_columns=toc_columns,
+        margin=margin,
     )
 
-    for section in sections:
-        bookmark_name = f"exercise-{section.exercise}"
-        print(f"Adding exercise {section.exercise}")
+    if actual_toc_pages != toc_page_count:
+        raise ValueError("Contents pagination changed unexpectedly. Re-run layout logic.")
 
-        if not section.source_images:
-            pdf.setPageSize((canvas_width, HEADER_HEIGHT + margin * 2))
-            pdf.setFillColor(white)
-            pdf.rect(0, 0, canvas_width, HEADER_HEIGHT + margin * 2, fill=1, stroke=0)
-            pdf.setFillColor(black)
-            pdf.setFont(HEADER_FONT_NAME, HEADER_FONT_SIZE)
-            pdf.drawString(margin, margin + HEADER_HEIGHT / 2, f"Exercise {section.exercise}")
-            pdf.bookmarkPage(bookmark_name)
-            pdf.addOutlineEntry(f"Exercise {section.exercise}", bookmark_name, level=0)
-            pdf.showPage()
-            continue
-
-        for index, image_path in enumerate(section.source_images):
-            print(f"  Adding image: {image_path}")
-            draw_image_page(
-                pdf,
-                image_path,
-                canvas_width,
-                margin,
-                exercise=section.exercise if index == 0 else None,
-            )
-            if index == 0:
-                pdf.bookmarkPage(bookmark_name)
-                pdf.addOutlineEntry(f"Exercise {section.exercise}", bookmark_name, level=0)
-            pdf.showPage()
+    draw_content_pages(
+        pdf,
+        content_pages,
+        starting_page_number=toc_page_count + 1,
+        margin=margin,
+    )
 
     pdf.save()
     print(f"\nPDF created: {output_pdf}")
@@ -376,6 +460,10 @@ def main() -> int:
         print("Error: toc-title must not be empty.", file=sys.stderr)
         return 1
 
+    if args.toc_columns <= 0:
+        print("Error: toc-columns must be greater than zero.", file=sys.stderr)
+        return 1
+
     sections = collect_sections(input_dir)
     if not sections:
         print("Error: no exercise folders with supported image files found.", file=sys.stderr)
@@ -391,6 +479,7 @@ def main() -> int:
             output_pdf=output_pdf,
             margin=args.margin,
             toc_title=args.toc_title,
+            toc_columns=args.toc_columns,
         )
         return 0
     except Exception as exc:
