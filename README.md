@@ -14,9 +14,14 @@ pip install -r requirements.txt
 pip install requests beautifulsoup4
 python src/reshakk_images.py 702
 python src/reshakk_images.py --start 700 --end 1132
+python src/reshakk_images.py --start 1 --end 1431 \
+  --page-url https://reshak.ru/otvet/otvet11.php \
+  --exercise-param otvet1 \
+  --predmet ""
 ```
 
 Each exercise folder starts with a generated `01.png` title image containing the exercise number. Downloaded page images are saved after that starting from `02.*`.
+The downloader supports both the default Reshak format `reshebniki.php?otvet=...&predmet=...` and alternate formats like `otvet11.php?otvet1=...` via `--page-url` and `--exercise-param`.
 
 ---
 

@@ -20,7 +20,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Iterable
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlencode, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup, Tag
@@ -29,6 +29,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 BASE_URL = "https://reshak.ru/otvet/reshebniki.php"
 DEFAULT_PREDMET = "nikol7"
+DEFAULT_EXERCISE_PARAM = "otvet"
 
 # Browser-like headers help with sites that dislike default Python requests.
 HEADERS = {
@@ -47,8 +48,22 @@ HEADERS = {
 }
 
 
-def build_page_url(exercise: str, predmet: str) -> str:
-    return f"{BASE_URL}?otvet={exercise}&predmet={predmet}"
+def build_page_url(
+    exercise: str,
+    page_url: str,
+    exercise_param: str,
+    predmet: str | None = None,
+    extra_params: dict[str, str] | None = None,
+) -> str:
+    query_params: dict[str, str] = {exercise_param: exercise}
+
+    if predmet:
+        query_params["predmet"] = predmet
+
+    if extra_params:
+        query_params.update(extra_params)
+
+    return f"{page_url}?{urlencode(query_params)}"
 
 
 def make_session() -> requests.Session:
@@ -250,11 +265,20 @@ def generate_exercise_number_image(
 def save_images_for_exercise(
     session: requests.Session,
     exercise: str,
-    predmet: str,
+    page_url: str,
+    exercise_param: str,
+    predmet: str | None,
+    extra_params: dict[str, str],
     output_root: Path,
     delay: float = 1.0,
 ) -> None:
-    page_url = build_page_url(exercise, predmet)
+    page_url = build_page_url(
+        exercise=exercise,
+        page_url=page_url,
+        exercise_param=exercise_param,
+        predmet=predmet,
+        extra_params=extra_params,
+    )
     exercise_dir = output_root / str(exercise)
     exercise_dir.mkdir(parents=True, exist_ok=True)
 
@@ -320,6 +344,22 @@ def parse_exercises(args: argparse.Namespace) -> list[str]:
     return result
 
 
+def parse_extra_params(values: Iterable[str]) -> dict[str, str]:
+    extra_params: dict[str, str] = {}
+
+    for item in values:
+        if "=" not in item:
+            raise ValueError(f"Invalid --param value '{item}'. Expected KEY=VALUE.")
+
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f"Invalid --param value '{item}'. Key must not be empty.")
+        extra_params[key] = value
+
+    return extra_params
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Download images from Reshak exercise pages."
@@ -334,7 +374,27 @@ def main() -> int:
     parser.add_argument(
         "--predmet",
         default=DEFAULT_PREDMET,
-        help=f"Predmet code, default: {DEFAULT_PREDMET}",
+        help=(
+            f"Predmet code, default: {DEFAULT_PREDMET}. "
+            "Pass an empty string to omit it for alternate URL formats."
+        ),
+    )
+    parser.add_argument(
+        "--page-url",
+        default=BASE_URL,
+        help=f"Exercise page URL, default: {BASE_URL}",
+    )
+    parser.add_argument(
+        "--exercise-param",
+        default=DEFAULT_EXERCISE_PARAM,
+        help=f"Query parameter name for the exercise number, default: {DEFAULT_EXERCISE_PARAM}",
+    )
+    parser.add_argument(
+        "--param",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Additional query parameter to include. Can be passed multiple times.",
     )
     parser.add_argument(
         "--out",
@@ -350,6 +410,11 @@ def main() -> int:
 
     args = parser.parse_args()
     exercise_numbers = parse_exercises(args)
+    try:
+        extra_params = parse_extra_params(args.param)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
 
     if not exercise_numbers:
         print("Provide exercise numbers or --start/--end range.", file=sys.stderr)
@@ -364,7 +429,10 @@ def main() -> int:
         save_images_for_exercise(
             session=session,
             exercise=exercise,
-            predmet=args.predmet,
+            page_url=args.page_url,
+            exercise_param=args.exercise_param,
+            predmet=args.predmet.strip() or None,
+            extra_params=extra_params,
             output_root=output_root,
             delay=args.delay,
         )
