@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -91,6 +92,17 @@ class ContentBlock:
         return header_height + self.draw_height
 
 
+class ImageProcessingError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class BadImageRecord:
+    exercise: str
+    path: Path
+    error: str
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Convert exercise image folders into a compact bookmarked PDF."
@@ -121,6 +133,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_TOC_COLUMNS,
         help=f"Number of columns on contents pages, default: {DEFAULT_TOC_COLUMNS}",
+    )
+    parser.add_argument(
+        "--skip-bad-images",
+        action="store_true",
+        help="Skip unreadable or truncated image files instead of stopping the PDF build",
     )
     return parser.parse_args()
 
@@ -168,15 +185,59 @@ def collect_sections(input_dir: Path) -> list[ExerciseSection]:
     return sections
 
 
+def extract_exercise_from_path(path: Path) -> str:
+    if len(path.parts) >= 2:
+        return path.parts[-2]
+    return "unknown"
+
+
+def record_bad_image(
+    bad_images: dict[str, list[BadImageRecord]],
+    seen_bad_paths: set[Path],
+    path: Path,
+    error: str,
+) -> None:
+    if path in seen_bad_paths:
+        return
+
+    exercise = extract_exercise_from_path(path)
+    bad_images[exercise].append(BadImageRecord(exercise=exercise, path=path, error=error))
+    seen_bad_paths.add(path)
+
+
+def print_bad_image_summary(bad_images: dict[str, list[BadImageRecord]]) -> None:
+    if not bad_images:
+        print("\nBad image summary: none")
+        return
+
+    exercises = sorted(bad_images, key=lambda value: path_sort_key(Path(value)))
+    total_images = sum(len(records) for records in bad_images.values())
+    print(f"\nBad image summary: {total_images} file(s) in {len(exercises)} exercise(s)")
+    print("Exercises with bad images:", ", ".join(exercises))
+
+    for exercise in exercises:
+        records = bad_images[exercise]
+        print(f"  {exercise}: {len(records)} bad image(s)")
+        for record in records:
+            print(f"    - {record.path.name}: {record.error}")
+
+
 def load_image_size(path: Path) -> tuple[int, int]:
-    with Image.open(path) as img:
-        img = ImageOps.exif_transpose(img)
-        return img.size
+    try:
+        with Image.open(path) as img:
+            img = ImageOps.exif_transpose(img)
+            img.load()
+            return img.size
+    except Exception as exc:
+        raise ImageProcessingError(f"{path}: {exc}") from exc
 
 
 def build_content_blocks(
     sections: list[ExerciseSection],
     margin: int,
+    skip_bad_images: bool,
+    bad_images: dict[str, list[BadImageRecord]],
+    seen_bad_paths: set[Path],
 ) -> list[ContentBlock]:
     blocks: list[ContentBlock] = []
     usable_width = PAGE_WIDTH - margin * 2
@@ -184,6 +245,7 @@ def build_content_blocks(
 
     for section in sections:
         bookmark_name = f"exercise-{section.exercise}"
+        section_has_blocks = False
 
         if not section.source_images:
             blocks.append(
@@ -196,10 +258,19 @@ def build_content_blocks(
                     bookmark_name=bookmark_name,
                 )
             )
+            section_has_blocks = True
             continue
 
         for index, image_path in enumerate(section.source_images):
-            source_width, source_height = load_image_size(image_path)
+            try:
+                source_width, source_height = load_image_size(image_path)
+            except ImageProcessingError as exc:
+                record_bad_image(bad_images, seen_bad_paths, image_path, str(exc))
+                if not skip_bad_images:
+                    raise
+                print(f"[WARN] Skipping bad image: {exc}", file=sys.stderr)
+                continue
+
             header_height = HEADER_FONT_SIZE + HEADER_SPACING if index == 0 else 0
             available_height = max(usable_height - header_height, 1)
             scale = min(usable_width / source_width, available_height / source_height, 1.0)
@@ -210,7 +281,22 @@ def build_content_blocks(
                     image_path=image_path,
                     draw_width=max(source_width * scale, 1),
                     draw_height=max(source_height * scale, 1),
-                    show_header=index == 0,
+                    show_header=not any(
+                        existing.exercise == section.exercise for existing in blocks
+                    ),
+                    bookmark_name=bookmark_name,
+                )
+            )
+            section_has_blocks = True
+
+        if not section_has_blocks:
+            blocks.append(
+                ContentBlock(
+                    exercise=section.exercise,
+                    image_path=None,
+                    draw_width=0,
+                    draw_height=0,
+                    show_header=True,
                     bookmark_name=bookmark_name,
                 )
             )
@@ -335,16 +421,20 @@ def draw_contents_pages(
 
 
 def render_image_to_rgb(path: Path) -> Image.Image:
-    with Image.open(path) as img:
-        img = ImageOps.exif_transpose(img)
+    try:
+        with Image.open(path) as img:
+            img = ImageOps.exif_transpose(img)
+            img.load()
 
-        if img.mode in ("RGBA", "LA") or "transparency" in img.info:
-            background = Image.new("RGB", img.size, (255, 255, 255))
-            rgba = img.convert("RGBA")
-            background.paste(rgba, mask=rgba.getchannel("A"))
-            return background
+            if img.mode in ("RGBA", "LA") or "transparency" in img.info:
+                background = Image.new("RGB", img.size, (255, 255, 255))
+                rgba = img.convert("RGBA")
+                background.paste(rgba, mask=rgba.getchannel("A"))
+                return background
 
-        return img.convert("RGB")
+            return img.convert("RGB")
+    except Exception as exc:
+        raise ImageProcessingError(f"{path}: {exc}") from exc
 
 
 def draw_content_pages(
@@ -352,6 +442,9 @@ def draw_content_pages(
     pages: list[list[ContentBlock]],
     starting_page_number: int,
     margin: int,
+    skip_bad_images: bool,
+    bad_images: dict[str, list[BadImageRecord]],
+    seen_bad_paths: set[Path],
 ) -> None:
     for page_offset, blocks in enumerate(pages):
         page_number = starting_page_number + page_offset
@@ -377,16 +470,28 @@ def draw_content_pages(
                 continue
 
             image_y = current_top - block.draw_height
-            with render_image_to_rgb(block.image_path) as rendered:
-                pdf.drawImage(
-                    ImageReader(rendered),
-                    (PAGE_WIDTH - block.draw_width) / 2,
-                    image_y,
-                    width=block.draw_width,
-                    height=block.draw_height,
-                    preserveAspectRatio=True,
-                    mask="auto",
+            try:
+                with render_image_to_rgb(block.image_path) as rendered:
+                    pdf.drawImage(
+                        ImageReader(rendered),
+                        (PAGE_WIDTH - block.draw_width) / 2,
+                        image_y,
+                        width=block.draw_width,
+                        height=block.draw_height,
+                        preserveAspectRatio=True,
+                        mask="auto",
+                    )
+            except ImageProcessingError as exc:
+                record_bad_image(
+                    bad_images,
+                    seen_bad_paths,
+                    block.image_path,
+                    str(exc),
                 )
+                if not skip_bad_images:
+                    raise
+                print(f"[WARN] Skipping bad image during render: {exc}", file=sys.stderr)
+                continue
             current_top = image_y
 
         draw_page_number(pdf, page_number)
@@ -399,11 +504,20 @@ def build_pdf(
     margin: int,
     toc_title: str,
     toc_columns: int,
+    skip_bad_images: bool,
+    bad_images: dict[str, list[BadImageRecord]],
+    seen_bad_paths: set[Path],
 ) -> None:
     if not sections:
         raise ValueError("No exercise folders with supported image files found.")
 
-    blocks = build_content_blocks(sections, margin)
+    blocks = build_content_blocks(
+        sections,
+        margin,
+        skip_bad_images=skip_bad_images,
+        bad_images=bad_images,
+        seen_bad_paths=seen_bad_paths,
+    )
     toc_page_count = compute_toc_page_count(len(sections), margin, toc_columns)
     content_pages, exercise_start_pages = paginate_content(
         blocks,
@@ -431,6 +545,9 @@ def build_pdf(
         content_pages,
         starting_page_number=toc_page_count + 1,
         margin=margin,
+        skip_bad_images=skip_bad_images,
+        bad_images=bad_images,
+        seen_bad_paths=seen_bad_paths,
     )
 
     pdf.save()
@@ -469,6 +586,9 @@ def main() -> int:
         print("Error: no exercise folders with supported image files found.", file=sys.stderr)
         return 1
 
+    bad_images: dict[str, list[BadImageRecord]] = defaultdict(list)
+    seen_bad_paths: set[Path] = set()
+
     print("Exercises to include:")
     for section in sections:
         print(f"  {section.exercise}: {len(section.source_images)} page image(s)")
@@ -480,10 +600,15 @@ def main() -> int:
             margin=args.margin,
             toc_title=args.toc_title,
             toc_columns=args.toc_columns,
+            skip_bad_images=args.skip_bad_images,
+            bad_images=bad_images,
+            seen_bad_paths=seen_bad_paths,
         )
+        print_bad_image_summary(bad_images)
         return 0
     except Exception as exc:
         print(f"Error while creating PDF: {exc}", file=sys.stderr)
+        print_bad_image_summary(bad_images)
         return 1
 
 
