@@ -21,11 +21,23 @@ python src/reshakk_images.py --start 1 --end 1431 \
   --exercise-param otvet1 \
   --predmet ""
 
+python src/reshakk_images.py --start 1 --end 1431 \
+  --page-url https://reshak.ru/otvet/otvet11.php \
+  --exercise-param otvet1 \
+  --predmet "atan10_11"
+
 # algebra nikilskiy 8
 python src/reshakk_images.py --start 1 --end 997 \
   --page-url https://reshak.ru/otvet/reshebniki.php \
   --exercise-param otvet \
-  --predmet "predmet=nikol8"
+  --predmet "nikol8"
+
+# geometry atanasian 10-11 with otvet=new/{exercise}
+python src/reshakk_images.py --start 1 --end 870 \
+  --page-url https://reshak.ru/otvet/reshebniki.php \
+  --exercise-param otvet \
+  --exercise-value-template "new/{exercise}" \
+  --predmet "atan10_11"
 ```
 https://reshak.ru/otvet/reshebniki.php?otvet=1&predmet=nikol7
 https://reshak.ru/otvet/reshebniki.php?otvet=2&predmet=nikol8
@@ -33,7 +45,7 @@ https://reshak.ru/otvet/otvet11.php?otvet1=1
 https://reshak.ru/otvet/reshebniki.php?otvet=new/870&predmet=atan10_11
 
 Each exercise folder starts with a generated `01.png` title image containing the exercise number. Downloaded page images are saved after that starting from `02.*`.
-The downloader supports both the default Reshak format `reshebniki.php?otvet=...&predmet=...` and alternate formats like `otvet11.php?otvet1=...` via `--page-url` and `--exercise-param`.
+The downloader supports the default Reshak format `reshebniki.php?otvet=...&predmet=...`, alternate formats like `otvet11.php?otvet1=...`, and prefixed exercise values like `reshebniki.php?otvet=new/852&predmet=atan10_11` via `--page-url`, `--exercise-param`, and `--exercise-value-template`.
 
 ---
 

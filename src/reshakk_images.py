@@ -30,6 +30,7 @@ from PIL import Image, ImageDraw, ImageFont
 BASE_URL = "https://reshak.ru/otvet/reshebniki.php"
 DEFAULT_PREDMET = "nikol7"
 DEFAULT_EXERCISE_PARAM = "otvet"
+DEFAULT_EXERCISE_VALUE_TEMPLATE = "{exercise}"
 
 # Browser-like headers help with sites that dislike default Python requests.
 HEADERS = {
@@ -52,10 +53,12 @@ def build_page_url(
     exercise: str,
     page_url: str,
     exercise_param: str,
+    exercise_value_template: str = DEFAULT_EXERCISE_VALUE_TEMPLATE,
     predmet: str | None = None,
     extra_params: dict[str, str] | None = None,
 ) -> str:
-    query_params: dict[str, str] = {exercise_param: exercise}
+    exercise_value = exercise_value_template.format(exercise=exercise)
+    query_params: dict[str, str] = {exercise_param: exercise_value}
 
     if predmet:
         query_params["predmet"] = predmet
@@ -63,7 +66,7 @@ def build_page_url(
     if extra_params:
         query_params.update(extra_params)
 
-    return f"{page_url}?{urlencode(query_params)}"
+    return f"{page_url}?{urlencode(query_params, safe='/')}"
 
 
 def make_session() -> requests.Session:
@@ -267,6 +270,7 @@ def save_images_for_exercise(
     exercise: str,
     page_url: str,
     exercise_param: str,
+    exercise_value_template: str,
     predmet: str | None,
     extra_params: dict[str, str],
     output_root: Path,
@@ -276,6 +280,7 @@ def save_images_for_exercise(
         exercise=exercise,
         page_url=page_url,
         exercise_param=exercise_param,
+        exercise_value_template=exercise_value_template,
         predmet=predmet,
         extra_params=extra_params,
     )
@@ -390,6 +395,14 @@ def main() -> int:
         help=f"Query parameter name for the exercise number, default: {DEFAULT_EXERCISE_PARAM}",
     )
     parser.add_argument(
+        "--exercise-value-template",
+        default=DEFAULT_EXERCISE_VALUE_TEMPLATE,
+        help=(
+            "Template for the exercise query value, default: {exercise}. "
+            "Use values like 'new/{exercise}' for URLs such as otvet=new/852."
+        ),
+    )
+    parser.add_argument(
         "--param",
         action="append",
         default=[],
@@ -431,6 +444,7 @@ def main() -> int:
             exercise=exercise,
             page_url=args.page_url,
             exercise_param=args.exercise_param,
+            exercise_value_template=args.exercise_value_template,
             predmet=args.predmet.strip() or None,
             extra_params=extra_params,
             output_root=output_root,
